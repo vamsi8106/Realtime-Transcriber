@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Real-Time Whisper STT</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; background: #f7f7f7; }
+    h2 { color: #333; }
+    .controls { margin-top: 1rem; }
+    button { padding: 10px 20px; margin-right: 10px; font-size: 16px; border: none; border-radius: 8px; cursor: pointer; }
+    #start { background-color: #28a745; color: white; }
+    #stop { background-color: #dc3545; color: white; }
+    #wsStart { background-color: #0077cc; color: white; }
+    #wsStop { background-color: #6c757d; color: white; }
+    .status { margin-top: 1rem; font-size: 16px; color: #555; }
+    #output { margin-top: 2rem; padding: 1rem; background: #fff; border-radius: 8px; box-shadow: 0 0 5px rgba(0,0,0,.1); white-space: pre-wrap; max-height: 350px; overflow-y: auto; }
+    .line { margin-bottom: .5rem; }
+  </style>
+</head>
+<body>
+  <h2>🎤 Real-Time Speech-to-Text</h2>
+  <div class="controls">
+    <button id="start">Start Recording (HTTP)</button>
+    <button id="stop" disabled>Stop (HTTP)</button>
+    <button id="wsStart">Start WS</button>
+    <button id="wsStop" disabled>Stop WS</button>
+  </div>
+
+  <div class="status" id="status">Status: Idle</div>
+  <div class="status" id="timer">Elapsed: 0s</div>
+  <div id="output"></div>
+
+  <script>
+    const BASE_URL = window.location.origin;                // same origin as API
+    const UPLOAD_URL = `${BASE_URL}/webhook/audio`;
+    const WS_URL = `${BASE_URL.replace('http', 'ws')}/ws/transcribe`;
+
+    let mediaRecorder;
+    let chunks = [];
+    let intervalId;
+    let elapsed = 0;
+    let timerInterval;
+    let stream;
+
+    const startBtn = document.getElementById('start');
+    const stopBtn = document.getElementById('stop');
+    const statusDiv = document.getElementById('status');
+    const outputDiv = document.getElementById('output');
+    const timerDiv = document.getElementById('timer');
+
+    function updateStatus(msg) {
+      statusDiv.textContent = "Status: " + msg;
+    }
+    function updateTimer() {
+      timerDiv.textContent = `Elapsed: ${elapsed}s`;
+    }
+
+    function pickMimeType() {
+      const candidates = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus',
+        'audio/ogg'
+      ];
+      for (const c of candidates) {
+        if (MediaRecorder.isTypeSupported(c)) return c;
+      }
+      return ''; // let the browser choose
+    }
+
+    // ---------- HTTP chunking ----------
+    startBtn.onclick = async () => {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const mimeType = pickMimeType();
+        mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        elapsed = 0;
+        updateTimer();
+        updateStatus("Recording (HTTP)...");
+
+        timerInterval = setInterval(() => { elapsed += 1; updateTimer(); }, 1000);
+
+        mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+
+        mediaRecorder.onstop = async () => {
+          if (chunks.length === 0) return;
+          updateStatus("Sending chunk (HTTP)...");
+          const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
+          chunks = [];
+
+          const formData = new FormData();
+          formData.append('file', blob, 'chunk.webm');
+
+          try {
+            const response = await fetch(UPLOAD_URL, { method: 'POST', body: formData });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const result = await response.json();
+            const ts = new Date().toLocaleTimeString();
+            const line = document.createElement('div');
+            line.className = 'line';
+            line.textContent = `[HTTP ${ts}] ${result.transcript || ''}`;
+            outputDiv.appendChild(line);
+            outputDiv.scrollTop = outputDiv.scrollHeight;
+            updateStatus("Recording (HTTP)...");
+          } catch (error) {
+            updateStatus("HTTP upload error");
+            console.error(error);
+          }
+        };
+
+        mediaRecorder.start();
+
+        // cut a chunk every N ms
+        intervalId = setInterval(() => {
+          if (mediaRecorder.state === 'recording') {
+            mediaRecorder.stop();
+            mediaRecorder.start();
+          }
+        }, 3000); // 3s chunks
+
+      } catch (err) {
+        console.error(err);
+        updateStatus("Mic permission denied or unsupported");
+      }
+    };
+
+    stopBtn.onclick = () => {
+      stopBtn.disabled = true;
+      startBtn.disabled = false;
+      clearInterval(intervalId);
+      clearInterval(timerInterval);
+      updateStatus("Stopped (HTTP)");
+      try { if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop(); } catch {}
+      try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch {}
+    };
+
+    // ---------- WebSocket streaming ----------
+    const wsStartBtn = document.getElementById('wsStart');
+    const wsStopBtn  = document.getElementById('wsStop');
+    let ws, wsInterval, wsMediaRecorder, wsStream, wsChunks = [];
+
+    wsStartBtn.onclick = async () => {
+      ws = new WebSocket(WS_URL);
+      ws.onopen = async () => {
+        // optional initial config
+        ws.send(JSON.stringify({ language: 'en' }));
+
+        ws.onmessage = (ev) => {
+          try {
+            const data = JSON.parse(ev.data);
+            if (data.ok && data.transcript) {
+              const ts = new Date().toLocaleTimeString();
+              const line = document.createElement('div');
+              line.className = 'line';
+              line.textContent = `[WS ${ts}] ${data.transcript}`;
+              outputDiv.appendChild(line);
+              outputDiv.scrollTop = outputDiv.scrollHeight;
+            }
+          } catch {}
+        };
+
+        try {
+          wsStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          const mimeType = pickMimeType();
+          wsMediaRecorder = new MediaRecorder(wsStream, mimeType ? { mimeType } : undefined);
+
+          wsMediaRecorder.ondataavailable = e => { if (e.data && e.data.size > 0) wsChunks.push(e.data); };
+          wsMediaRecorder.onstop = async () => {
+            if (wsChunks.length === 0) return;
+            const blob = new Blob(wsChunks, { type: mimeType || 'audio/webm' });
+            wsChunks = [];
+            const buf = await blob.arrayBuffer();
+            if (ws && ws.readyState === WebSocket.OPEN) ws.send(buf);
+          };
+
+          wsMediaRecorder.start();
+          wsInterval = setInterval(() => {
+            if (wsMediaRecorder.state === 'recording') {
+              wsMediaRecorder.stop();   // triggers onstop -> send chunk
+              wsMediaRecorder.start();
+            }
+          }, 3000); // 3s chunks
+
+          wsStartBtn.disabled = true;
+          wsStopBtn.disabled  = false;
+          updateStatus("WS Recording...");
+        } catch (e) {
+          console.error(e);
+          updateStatus("Mic permission denied or unsupported (WS)");
+        }
+      };
+      ws.onerror = () => updateStatus("WS error");
+      ws.onclose = () => updateStatus("WS closed");
+    };
+
+    wsStopBtn.onclick = () => {
+      clearInterval(wsInterval);
+      try { if (wsMediaRecorder && wsMediaRecorder.state !== 'inactive') wsMediaRecorder.stop(); } catch {}
+      try { if (wsStream) wsStream.getTracks().forEach(t => t.stop()); } catch {}
+      try { if (ws && ws.readyState === WebSocket.OPEN) ws.close(); } catch {}
+      wsStartBtn.disabled = false;
+      wsStopBtn.disabled  = true;
+      updateStatus("WS Stopped");
+    };
+  </script>
+</body>
+</html>
